@@ -6,8 +6,15 @@
 #include <iostream>
 #include <functional>
 
+std::vector<DataType> makeTypes(const std::vector<DataType>& types, bool allowsDuplicate) {
+	auto res = types;
+	if (allowsDuplicate)
+		res.push_back(DataType::INT64);
+	return res;
+}
+
 Index::Index(const std::vector<DataType>& types, const std::vector<std::string>& names, bool allowsDuplicate) :
-	types(types), names(names), allowsDuplicate(allowsDuplicate),
+	types(makeTypes(types, allowsDuplicate)), names(names), allowsDuplicate(allowsDuplicate),
 	maxBranchingFactor(computeBranchingFactor(types, BLOCK_SIZE)),
 	maxLazySize(sqrt(maxBranchingFactor)), // (13.3) - Then, non-static data members are initialized in the order they were declared in the class definition (again regardless of the order of the mem-initializers).
 	root(new Node(true, maxBranchingFactor, maxLazySize))
@@ -27,21 +34,32 @@ Index::~Index()
 	clean(root);
 }
 
-bool Index::insert(const PackedData& key, int rid, bool checksIntegrity)
+bool Index::insert(const PackedData& key, Int64 rid, bool checksIntegrity)
 {
-	if(checksIntegrity && !allowsDuplicate && !select(key).empty())
+	PackedData temp;
+	if (!allowsDuplicate)
+		temp = key;
+	else {
+		PackedData pair(key.size() + sizeof(Int64));
+		pair = key;
+		pair.push(rid);
+		temp = std::move(pair);
+	}
+
+	if(checksIntegrity && !allowsDuplicate && !select(temp).empty())
 		return false;
 
 	std::vector<KeyValue> tempKvs;
-	tempKvs.push_back(KeyValue(key, rid));
+	tempKvs.push_back(KeyValue(std::move(temp), rid));
 	auto res = insert(root, std::move(tempKvs));
 	maintainRoot(std::move(res));
 	return true;
 }
 
-std::optional<Index::KeyValue> Index::insert(Node* curr, std::vector<KeyValue>&& tempKvs)
+Index::Result Index::insert(Node* curr, std::vector<KeyValue>&& tempKvs)
 {
-	assert(!tempKvs.empty());
+	if (tempKvs.empty())
+		return {};
 
 	curr->kvsToInsert.insert(curr->kvsToInsert.end(),
 		std::make_move_iterator(tempKvs.begin()),
@@ -52,67 +70,57 @@ std::optional<Index::KeyValue> Index::insert(Node* curr, std::vector<KeyValue>&&
 
 	if (!curr->isLeaf) {
 		// pushdown kvsToInsert in the correct children
+		sortKvs(curr);
+		invalidateDuplicate(curr->kvsToInsert, curr->kvsToRemove);
 
-		auto cmp = std::bind(&Index::compareKeyValue, this, std::placeholders::_1, std::placeholders::_2);
-		std::sort(curr->kvsToInsert.begin(), curr->kvsToInsert.end(), cmp);
-		std::sort(curr->kvsUnsorted.begin(), curr->kvsUnsorted.end(), cmp);
-
-		auto downIt = curr->kvsToInsert.begin();
-		auto upIt = curr->kvsUnsorted.begin();
-		auto mainIt = curr->kvs.begin();
+		auto itToInsert = curr->kvsToInsert.begin();
+		auto it = curr->kvs.begin();
 
 		std::vector<KeyValue> pulledUp;
 
-		while (mainIt != curr->kvs.end() || upIt != curr->kvsUnsorted.end()) {
-			auto& it =
-				upIt == curr->kvsUnsorted.end() ? mainIt :
-				mainIt == curr->kvs.end() ? upIt :
-				compareKeyValue(*mainIt, *upIt) ? mainIt : upIt;
-
+		while (it != curr->kvs.end()){
 			if (it->value.child == nullptr) {
 				it++;
 				continue;
 			}
 
 			std::vector<KeyValue> pd;
-			while (downIt != curr->kvsToInsert.end()) {
-				if (downIt->value.rid == -1) {
-					downIt++;
+			while (itToInsert != curr->kvsToInsert.end()) {
+				if (itToInsert->value.rid == -1) {
+					itToInsert++;
 					continue;
 				}
-				auto res = compareKeyValue(*downIt, *it);
+				auto res = compareKeyValue(*itToInsert, *it);
 				if (!res)
 					break;
-				// *downIt < *it
-				pd.push_back(std::move(*downIt));
-				downIt++;
+				// *itToInsert < *it
+				pd.push_back(std::move(*itToInsert));
+				itToInsert++;
 			}
-			if (!pd.empty()) {
-				auto res = insert(it->value.child, std::move(pd));
-				if (res.has_value())
-					pulledUp.push_back(std::move(res.value()));
+			auto res = insert(it->value.child, std::move(pd));
+			if (res.hasMerged) {
+				assert(!res.kvToInsert.has_value());
+				curr->numKvs--;
 			}
-
+			if (res.kvToInsert.has_value()) {
+				assert(!res.hasMerged);
+				pulledUp.push_back(std::move(res.kvToInsert.value()));
+			}
 			it++;
 		}
-		assert(downIt == curr->kvsToInsert.end());
+		assert(itToInsert == curr->kvsToInsert.end()); // since the last key is always null, greater than anything else
 		curr->kvsToInsert.clear();
 
-		curr->numKvs += pulledUp.size();
+		curr->numKvs += (int)pulledUp.size();
 		curr->kvsUnsorted.insert(curr->kvsUnsorted.end(),
 			std::make_move_iterator(pulledUp.begin()),
 			std::make_move_iterator(pulledUp.end()));
 		for(auto it = curr->kvsUnsorted.end() - pulledUp.size(); it != curr->kvsUnsorted.end(); it++)
 			it->value.child->parentIt = it;
-
-		if (curr->kvsUnsorted.size() <= maxLazySize && curr->numKvs >= (maxBranchingFactor+1)/2)
-			return {};
-
-		std::sort(curr->kvsUnsorted.begin(), curr->kvsUnsorted.end(), cmp);
 	}
 	else {
-		// kvsUnsorted are simply not used in a leaf node
-		curr->numKvs += curr->kvsToInsert.size();
+		// finally stop pushing down at a leaf node
+		curr->numKvs += (int)curr->kvsToInsert.size();
 		for (auto& kv : curr->kvsToInsert)
 			if (kv.value.rid == -1)
 				curr->numKvs--;
@@ -122,24 +130,109 @@ std::optional<Index::KeyValue> Index::insert(Node* curr, std::vector<KeyValue>&&
 	return maintain(curr);
 }
 
-bool Index::remove(const PackedData& key, int rid, bool checksIntegrity)
+bool Index::remove(const PackedData& key, Int64 rid, bool checksIntegrity)
 {
 	if (checksIntegrity && !select(key, rid))
 		return false;
 
+	PackedData temp;
+	if (!allowsDuplicate)
+		temp = key;
+	else {
+		PackedData pair(key.size() + sizeof(Int64));
+		pair = key;
+		pair.push(rid);
+		temp = std::move(pair);
+	}
+
 	std::vector<KeyValue> tempKvs;
-	tempKvs.push_back(KeyValue(key, rid));
+	tempKvs.push_back(KeyValue(std::move(temp), rid));
+
 	auto res = remove(root, std::move(tempKvs));
 	maintainRoot(std::move(res));
 	return true;
 }
 
-std::optional<Index::KeyValue> Index::remove(Node* curr, std::vector<KeyValue>&& tempKvs)
+Index::Result Index::remove(Node* curr, std::vector<KeyValue>&& tempKvs)
 {
 	// discrepancy that (++parentIt).key != curr->kv.front().key is actually OK
-	// as long as all keys are bounded above by the key in its parent
-	assert(false);
-	return {};
+	// as long as all keys are bounded above by the corresponding key in its parent
+	if (tempKvs.empty())
+		return {};
+
+	curr->kvsToRemove.insert(curr->kvsToRemove.end(),
+		std::make_move_iterator(tempKvs.begin()),
+		std::make_move_iterator(tempKvs.end()));
+
+	if (curr->kvsToRemove.size() <= maxLazySize)
+		return {};
+
+	if (!curr->isLeaf) {
+		// pushdown kvsToRemove in the correct children
+		sortKvs(curr);
+		invalidateDuplicate(curr->kvsToInsert, curr->kvsToRemove);
+
+		auto itToRemove = curr->kvsToRemove.begin();
+		auto it = curr->kvs.begin();
+
+		std::vector<KeyValue> pulledUp;
+
+		while (it != curr->kvs.end()) {
+			if (it->value.child == nullptr) {
+				it++;
+				continue;
+			}
+
+			std::vector<KeyValue> pd;
+			while (itToRemove != curr->kvsToRemove.end()) {
+				if (itToRemove->value.rid == -1) {
+					itToRemove++;
+					continue;
+				}
+				auto res = compareKeyValue(*itToRemove, *it);
+				if (!res)
+					break;
+				// *itToRemove < *it
+				pd.push_back(std::move(*itToRemove));
+				itToRemove++;
+			}
+			auto res = remove(it->value.child, std::move(pd));
+			if (res.hasMerged) {
+				assert(!res.kvToInsert.has_value());
+				curr->numKvs--;
+			}
+			if (res.kvToInsert.has_value()) {
+				assert(!res.hasMerged);
+				pulledUp.push_back(std::move(res.kvToInsert.value()));
+			}
+			it++;
+		}
+		assert(itToRemove == curr->kvsToRemove.end()); // since the last key is always null, greater than anything else
+		curr->kvsToRemove.clear();
+
+		curr->numKvs += (int)pulledUp.size();
+		curr->kvsUnsorted.insert(curr->kvsUnsorted.end(),
+			std::make_move_iterator(pulledUp.begin()),
+			std::make_move_iterator(pulledUp.end()));
+		for (auto it = curr->kvsUnsorted.end() - pulledUp.size(); it != curr->kvsUnsorted.end(); it++)
+			it->value.child->parentIt = it;
+	}
+	else {
+		// finally stop pushing down at a leaf node
+		invalidateDuplicate(curr->kvsToInsert, curr->kvsToRemove);
+		curr->numKvs -= (int)curr->kvsToRemove.size();
+		for (auto& kv : curr->kvsToRemove)
+			if (kv.value.rid == -1)
+				curr->numKvs++;
+		sortKvs(curr);
+		invalidateDuplicate(curr->kvs, curr->kvsToRemove);
+		sortKvs(curr);
+		for (auto& kv : curr->kvsToRemove)
+			assert(kv.value.rid == -1);
+		curr->kvsToRemove.clear();
+	}
+
+	return maintain(curr);
 }
 
 std::vector<int> Index::select(const PackedData& key)
@@ -161,7 +254,7 @@ std::vector<int> Index::select(const PackedData& keyLo, const PackedData& keyhi)
 	return std::vector<int>();
 }
 
-bool Index::select(const PackedData& key, int rid)
+bool Index::select(const PackedData& key, Int64 rid)
 {
 	assert(false);
 	return false;
@@ -169,14 +262,22 @@ bool Index::select(const PackedData& key, int rid)
 
 void Index::sortKvs(Node* curr)
 {
-	int k = curr->kvs.size();
-	auto cmp = std::bind(&Index::compareKeyValue, this, std::placeholders::_1, std::placeholders::_2);
-	std::sort(curr->kvsUnsorted.begin(), curr->kvsUnsorted.end(), cmp);
-	curr->kvs.insert(curr->kvs.end(),
-		std::make_move_iterator(curr->kvsUnsorted.begin()),
-		std::make_move_iterator(curr->kvsUnsorted.end()));
-	std::inplace_merge(curr->kvs.begin(), curr->kvs.begin() + k, curr->kvs.end(), cmp);
-	curr->kvsUnsorted.clear();
+	if (curr->kvsUnsorted.empty() && curr->kvs.size() == curr->numKvs)
+		return;
+
+	// merge kvsUnsorted into kvs
+	if (!curr->kvsUnsorted.empty()) {
+		int k = (int)curr->kvs.size();
+		auto cmp = std::bind(&Index::compareKeyValue, this, std::placeholders::_1, std::placeholders::_2);
+		std::sort(curr->kvsUnsorted.begin(), curr->kvsUnsorted.end(), cmp);
+		curr->kvs.insert(curr->kvs.end(),
+			std::make_move_iterator(curr->kvsUnsorted.begin()),
+			std::make_move_iterator(curr->kvsUnsorted.end()));
+		std::inplace_merge(curr->kvs.begin(), curr->kvs.begin() + k, curr->kvs.end(), cmp);
+		curr->kvsUnsorted.clear();
+	}
+
+	// pull out removed kvs
 	auto it = curr->kvs.begin();
 	auto it2 = curr->kvs.begin();
 	while (it2 != curr->kvs.end()) {
@@ -188,6 +289,8 @@ void Index::sortKvs(Node* curr)
 			while (it2 != curr->kvs.end() && it2->value.child == nullptr)
 				it2++;
 		}
+		if (it2 == curr->kvs.end())
+			break;
 		if (it != it2)
 			std::swap(*it, *it2);
 		if (!curr->isLeaf)
@@ -196,60 +299,221 @@ void Index::sortKvs(Node* curr)
 		it2++;
 	}
 	assert(it - curr->kvs.begin() == curr->numKvs);
-	int numRemoved = curr->kvs.end() - it;
+	int numRemoved = (int)(curr->kvs.end() - it);
 	for (int i = 0; i < numRemoved; i++)
 		curr->kvs.pop_back();
+
 	assert(curr->kvs.size() == curr->numKvs);
 	assert(curr->kvsUnsorted.size() == 0);
 }
 
-std::optional<Index::KeyValue> Index::maintain(Node* curr)
+void Index::invalidateDuplicate(std::vector<KeyValue>& kvs1, std::vector<KeyValue>& kvs2)
 {
-	sortKvs(curr);
-	if (curr != root && curr->numKvs < (maxBranchingFactor + 1) / 2) {
-		//redistribute();
-		assert(false);
-		return {};
-	}
+	std::sort(kvs1.begin(), kvs1.end(),
+		[this](const KeyValue& kv1, const KeyValue& kv2) {return compareKeyValue(kv1, kv2); });
 
-	if (curr->numKvs <= maxBranchingFactor)
-		return {};
+	std::sort(kvs2.begin(), kvs2.end(),
+		[this](const KeyValue& kv1, const KeyValue& kv2) {return compareKeyValue(kv1, kv2); });
 
-	// split curr->kvs
-	int k = curr->numKvs / 2;
-	auto prev = new Node(curr->isLeaf, maxBranchingFactor, maxLazySize);
-	if (curr->prev != nullptr) {
-		curr->prev->next = prev;
-		prev->prev = curr->prev;
-	}
-	curr->prev = prev;
-	prev->next = curr;
-	prev->kvs.insert(prev->kvs.end(),
-		std::make_move_iterator(curr->kvs.begin()),
-		std::make_move_iterator(curr->kvs.begin() + k));
-	if (curr->isLeaf) {
-		// copy the k-th kv and pull it up
-		int n = curr->numKvs;
-		curr->kvs.erase(curr->kvs.begin(), curr->kvs.begin() + k);
-		prev->numKvs = prev->kvs.size();
-		curr->numKvs = curr->kvs.size();
-		return KeyValue(curr->kvs.front().key, prev);
-	}
-	else {
-		// erase the k-th kv and pull it up
-		auto key = std::move(curr->kvs[k].key);
-		prev->kvs.emplace_back(curr->kvs[k].value.child);
-		curr->kvs.erase(curr->kvs.begin(), curr->kvs.begin() + k + 1);
-		prev->numKvs = prev->kvs.size();
-		curr->numKvs = curr->kvs.size();
-		return KeyValue(std::move(key), prev);
+	if (kvs1.empty() || kvs2.empty())
+		return;
+
+	// (with the same key)
+	// invalid pendingInserts and pendingRemoves -> ignore
+	// count # valid pendingInserts and pendingRemoves, abs (diff #) is at most 1
+
+	auto it1 = kvs1.begin();
+	auto it2 = kvs2.begin();
+	while (it1 != kvs1.end() && it2 != kvs2.end()) {
+		if (it1->value.rid == -1) {
+			it1++;
+			continue;
+		}
+		if (it2->value.rid == -1) {
+			it2++;
+			continue;
+		}
+		int cmp = comparePackData(it1->key, it2->key);
+		if (cmp == 0) {
+			it1->value.rid = -1;
+			it2->value.rid = -1;
+			it1++;
+			it2++;
+		}
+		else if (cmp < 0)
+			it1++;
+		else
+			it2++;
 	}
 }
 
-void Index::maintainRoot(std::optional<KeyValue>&& res) {
-	if (res.has_value()) {
+Index::Result Index::maintain(Node* curr)
+{
+	if (curr->kvs.size() > maxBranchingFactor || curr->kvsUnsorted.size() > maxLazySize)
+		sortKvs(curr);
+
+	// todo: what if # kvsToInsert or kvsToRemove exceeds maxLazySize after redistribute or merge?
+
+	if (curr != root && curr->numKvs < (maxBranchingFactor + 1) / 2) {
+		// regard the first kv as special and allow small numKvs
+		// -- this doesn't affect much overall with large enough branching factor
+		if (curr->prev == nullptr || curr->prev->parentIt->key.get() == nullptr)
+			return {};
+
+		sortKvs(curr);
+		
+		auto prev = curr->prev;
+		if (prev->numKvs + curr->numKvs <= maxBranchingFactor) {
+			// merge with prev
+			// invalidate and delete curr
+			int k = prev->numKvs;
+			prev->next = curr->next;
+			if (curr->next != nullptr)
+				curr->next->prev = prev;
+			prev->kvs.insert(prev->kvs.end(),
+				std::make_move_iterator(curr->kvs.begin()),
+				std::make_move_iterator(curr->kvs.end()));
+			if (!prev->isLeaf) {
+				for (auto it = prev->kvs.end() - k; it != prev->kvs.end(); it++)
+					it->value.child->parentIt = it;
+			}
+			assert(curr->kvsUnsorted.empty());
+			prev->kvsToInsert.insert(prev->kvsToInsert.end(),
+				std::make_move_iterator(curr->kvsToInsert.begin()),
+				std::make_move_iterator(curr->kvsToInsert.end()));
+			prev->kvsToRemove.insert(prev->kvsToRemove.end(),
+				std::make_move_iterator(curr->kvsToRemove.begin()),
+				std::make_move_iterator(curr->kvsToRemove.end()));
+			if (curr->parentIt->key.get() == nullptr)
+				prev->parentIt->key.reset();
+			else
+				prev->parentIt->key = curr->parentIt->key;
+			curr->parentIt->value.child = nullptr;
+			prev->numKvs += curr->numKvs;
+			delete curr;
+			return Result{ .hasMerged = true };
+		}
+		else {
+			// redistribute with prev
+			sortKvs(prev);
+			int k = (prev->numKvs + curr->numKvs) / 2 - curr->numKvs;
+			assert(k > 0);
+			prev->numKvs -= k;
+			curr->numKvs += k;
+			prev->parentIt->key = (prev->kvs.end() - k)->key;
+			curr->kvsUnsorted.insert(curr->kvsUnsorted.end(),
+				std::make_move_iterator(prev->kvs.end() - k),
+				std::make_move_iterator(prev->kvs.end()));
+			if (!curr->isLeaf) {
+				for (auto it = curr->kvsUnsorted.end() - k; it != curr->kvsUnsorted.end(); it++)
+					it->value.child->parentIt = it;
+			}
+			prev->kvs.erase(prev->kvs.end() - k, prev->kvs.end());
+			assert(prev->kvsUnsorted.empty());
+			for (auto& kv : prev->kvsToInsert) {
+				if (compareKeyValue(kv, *prev->parentIt))
+					continue;
+				if (!curr->isLeaf) {
+					curr->kvsToInsert.emplace_back(std::move(kv.key), kv.value.child);
+					kv.value.child = nullptr;
+				}
+				else {
+					curr->kvsToInsert.emplace_back(std::move(kv.key), kv.value.rid);
+					kv.value.rid = -1;
+				}
+			}
+			for (auto& kv : prev->kvsToRemove) {
+				if (compareKeyValue(kv, *prev->parentIt))
+					continue;
+				if (!curr->isLeaf) {
+					curr->kvsToRemove.emplace_back(std::move(kv.key), kv.value.child);
+					kv.value.child = nullptr;
+				}
+				else {
+					curr->kvsToRemove.emplace_back(std::move(kv.key), kv.value.rid);
+					kv.value.rid = -1;
+				}
+			}
+			return {};
+		}
+	}
+
+	if (curr->numKvs > maxBranchingFactor) {
+		sortKvs(curr);
+
+		// split
+		assert(curr->numKvs < maxBranchingFactor * 2);
+		int k = curr->numKvs / 2;
+		auto prev = new Node(curr->isLeaf, maxBranchingFactor, maxLazySize);
+		prev->prev = curr->prev;
+		if (curr->prev != nullptr)
+			curr->prev->next = prev;
+		curr->prev = prev;
+		prev->next = curr;
+		prev->kvs.insert(prev->kvs.end(),
+			std::make_move_iterator(curr->kvs.begin()),
+			std::make_move_iterator(curr->kvs.begin() + k));
+		if (!prev->isLeaf) {
+			for (auto it = prev->kvs.begin(); it != prev->kvs.end(); it++)
+				it->value.child->parentIt = it;
+		}
+		if (curr->isLeaf) {
+			// copy the k-th kv and pull it up
+			int n = curr->numKvs;
+			curr->kvs.erase(curr->kvs.begin(), curr->kvs.begin() + k);
+			prev->numKvs = (int)prev->kvs.size();
+			curr->numKvs = (int)curr->kvs.size();
+			auto res = KeyValue(curr->kvs.front().key, prev);
+			for (auto& kv : curr->kvsToInsert) {
+				if (compareKeyValue(kv, res)) {
+					prev->kvsToInsert.emplace_back(std::move(kv.key), kv.value.rid);
+					kv.value.rid = -1;
+				}
+			}
+			for (auto& kv : curr->kvsToRemove) {
+				if (compareKeyValue(kv, res)) {
+					prev->kvsToRemove.emplace_back(std::move(kv.key), kv.value.rid);
+					kv.value.rid = -1;
+				}
+			}
+			return Result{ .kvToInsert = std::move(res) };
+		}
+		else {
+			// erase the k-th kv and pull it up
+			auto key = std::move(curr->kvs[k].key);
+			prev->kvs.emplace_back(curr->kvs[k].value.child);
+			curr->kvs.erase(curr->kvs.begin(), curr->kvs.begin() + k + 1);
+			prev->numKvs = (int)prev->kvs.size();
+			curr->numKvs = (int)curr->kvs.size();
+			auto res = KeyValue(std::move(key), prev);
+			for (auto& kv : curr->kvsToInsert) {
+				if (compareKeyValue(kv, res)) {
+					prev->kvsToInsert.emplace_back(std::move(kv.key), kv.value.child);
+					kv.value.child = nullptr;
+				}
+			}
+			for (auto& kv : curr->kvsToRemove) {
+				if (compareKeyValue(kv, res)) {
+					prev->kvsToRemove.emplace_back(std::move(kv.key), kv.value.child);
+					kv.value.child = nullptr;
+				}
+			}
+			return Result{ .kvToInsert = std::move(res) };
+		}
+	}
+
+	return {};
+}
+
+void Index::maintainRoot(Result&& res) {
+	if (res.hasMerged) {
+		assert(!res.kvToInsert.has_value());
+		root->numKvs--;
+	}
+	if (res.kvToInsert.has_value()) {
+		assert(!res.hasMerged);
 		auto node = new Node(false, maxBranchingFactor, maxLazySize);
-		node->kvs.push_back(std::move(res.value()));
+		node->kvs.push_back(std::move(res.kvToInsert.value()));
 		node->kvs.emplace_back(root);
 		node->kvs.front().value.child->parentIt = node->kvs.begin();
 		node->kvs.back().value.child->parentIt = node->kvs.begin() + 1;
@@ -265,6 +529,15 @@ void Index::maintainRoot(std::optional<KeyValue>&& res) {
 
 void Index::clean(Node* curr)
 {
+	if (curr == nullptr)
+		return;
+	if (!curr->isLeaf) {
+		for (auto& kv : curr->kvs)
+			clean(kv.value.child);
+		for (auto& kv : curr->kvsUnsorted)
+			clean(kv.value.child);
+	}
+	delete curr;
 }
 
 void Index::dump(std::ostream& os)
@@ -280,10 +553,12 @@ void Index::dump(Node* curr, std::ostream& os)
 	os << "numKvs = " << curr->numKvs << "\n";
 	os << "kvs = ";
 	dump(curr->kvs, curr->isLeaf, os);
-	os << "kvsToInsert = ";
-	dump(curr->kvsToInsert, curr->isLeaf, os);
 	os << "kvsUnsorted = ";
 	dump(curr->kvsUnsorted, curr->isLeaf, os);
+	os << "kvsToInsert = ";
+	dump(curr->kvsToInsert, true, os);
+	os << "kvsToRemove = ";
+	dump(curr->kvsToRemove, true, os);
 	if (!curr->isLeaf) {
 		for (auto& kv : curr->kvs) {
 			if (kv.value.child != nullptr)
@@ -296,7 +571,7 @@ void Index::dump(Node* curr, std::ostream& os)
 	}
 }
 
-void Index::dump(const std::vector<KeyValue>& kvs, bool isLeaf, std::ostream& os)
+void Index::dump(const std::vector<KeyValue>& kvs, bool printsRID, std::ostream& os)
 {
 	os << "[";
 	for (auto& kv : kvs) {
@@ -337,7 +612,7 @@ void Index::dump(const std::vector<KeyValue>& kvs, bool isLeaf, std::ostream& os
 			os << ")";
 		}
 		os << ",";
-		if (isLeaf)
+		if (printsRID)
 			os << kv.value.rid;
 		else
 			os << kv.value.child;
@@ -348,36 +623,94 @@ void Index::dump(const std::vector<KeyValue>& kvs, bool isLeaf, std::ostream& os
 
 void Index::checkIntegrity()
 {
-	checkIntegrity(root, PackedData());
+	checkIntegrity(root, PackedData(), false, PackedData());
 }
 
-void Index::checkIntegrity(Node* curr, const PackedData& ub)
+void Index::checkIntegrity(Node* curr, const PackedData& lb, bool existsLB, const PackedData& ub)
 {
 	if (!curr->isLeaf) {
+		bool existsPrev = false;
+		bool reachedLast = false;
+		PackedData prevKey;
+		std::vector<KeyValue> sorted;
 		for (auto& kv : curr->kvs) {
-			assert(kv.key.get() == nullptr || kv.value.child == nullptr || comparePackData(kv.key, ub) < 0);
-			if (kv.value.child != nullptr)
-				checkIntegrity(kv.value.child, kv.key);
+			if (kv.value.child == nullptr)
+				continue;
+			if (kv.key.get() == nullptr)
+				sorted.push_back(KeyValue(kv.value.child));
+			else
+				sorted.push_back(KeyValue(kv.key, kv.value.child));
 		}
 		for (auto& kv : curr->kvsUnsorted) {
-			assert(kv.key.get() == nullptr || kv.value.child == nullptr || comparePackData(kv.key, ub) < 0);
+			if (kv.value.child == nullptr)
+				continue;
+			sorted.push_back(KeyValue(kv.key, kv.value.child));
+		}
+		std::sort(sorted.begin(), sorted.end(), [this](const KeyValue& kv1, const KeyValue& kv2) {return compareKeyValue(kv1, kv2); });
+		for (auto& kv : sorted) {
+			assert(kv.key.get() == nullptr || kv.value.child == nullptr ||
+				(comparePackData(kv.key, ub) < 0 && (!existsLB || comparePackData(kv.key, lb) >= 0)));
+			assert(!reachedLast);
 			if (kv.value.child != nullptr)
-				checkIntegrity(kv.value.child, kv.key);
+				checkIntegrity(kv.value.child, prevKey, existsPrev, kv.key);
+			if (kv.key.get() == nullptr)
+				reachedLast = true;
+			else if (kv.value.child != nullptr) {
+				if (existsPrev)
+					assert(comparePackData(prevKey, kv.key) < 0);
+				existsPrev = true;
+				prevKey = kv.key;
+			}
+		}
+		for (auto& kv : curr->kvsToInsert) {
+			assert(kv.value.child == nullptr ||
+				(comparePackData(kv.key, ub) < 0 && (!existsLB || comparePackData(kv.key, lb) >= 0)));
+		}
+		for (auto& kv : curr->kvsToRemove) {
+			assert(kv.value.child == nullptr ||
+				(comparePackData(kv.key, ub) < 0 && (!existsLB || comparePackData(kv.key, lb) >= 0)));
 		}
 	}
 	else {
+		bool existsPrev = false;
+		PackedData prevKey;
+		std::vector<KeyValue> sorted;
 		for (auto& kv : curr->kvs) {
-			assert(kv.key.get() == nullptr || kv.value.rid == -1 || comparePackData(kv.key, ub) < 0);
+			if (kv.value.rid == -1)
+				continue;
+			sorted.push_back(KeyValue(kv.key, kv.value.child));
 		}
 		for (auto& kv : curr->kvsUnsorted) {
-			assert(kv.key.get() == nullptr || kv.value.rid == -1 || comparePackData(kv.key, ub) < 0);
+			if(kv.value.rid == -1)
+				continue;
+			sorted.push_back(KeyValue(kv.key, kv.value.child));
+		}
+		std::sort(sorted.begin(), sorted.end(), [this](const KeyValue& kv1, const KeyValue& kv2) {return compareKeyValue(kv1, kv2); });
+		for (auto& kv : sorted) {
+			assert(kv.key.get() != nullptr);
+			assert(kv.value.rid == -1 ||
+				(comparePackData(kv.key, ub) < 0 && (!existsLB || comparePackData(kv.key, lb) >= 0)));
+			if (kv.value.rid != -1) {
+				if (existsPrev)
+					assert(comparePackData(prevKey, kv.key) < 0);
+				existsPrev = true;
+				prevKey = kv.key;
+			}
+		}
+		for (auto& kv : curr->kvsToInsert) {
+			assert(kv.value.rid == -1 ||
+				(comparePackData(kv.key, ub) < 0 && (!existsLB || comparePackData(kv.key, lb) >= 0)));
+		}
+		for (auto& kv : curr->kvsToRemove) {
+			assert(kv.value.rid == -1 ||
+				(comparePackData(kv.key, ub) < 0 && (!existsLB || comparePackData(kv.key, lb) >= 0)));
 		}
 	}
 }
 
 int Index::computeBranchingFactor(const std::vector<DataType>& types, int size)
 {
-	int keySize = PackedData::getSize(types);
+	int keySize = PackedData::computeSize(types);
 	keySize += 3 - (keySize + 3) % 4;
 	auto computeSize = [=](int k) {
 		int size = sizeof(Node);

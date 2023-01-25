@@ -62,10 +62,13 @@ class PackedData {
 public:
 	PackedData();
 	PackedData(const std::vector<DataType>& types, const std::vector<std::string>& data);
+	PackedData(int capacity);
 
 	PackedData(const PackedData& other);
 	PackedData(PackedData&& other) noexcept;
+	PackedData& operator=(const PackedData& other);
 	PackedData& operator=(PackedData&& other) noexcept;
+	void reset();
 	~PackedData();
 
 	void push(std::int32_t val);
@@ -77,12 +80,13 @@ public:
 	void push(const DateTime& val);
 	void push(const HashedInt& val);
 
-	void* get() const { return base; }
-	static int getSize(const std::vector<DataType>& types);
+	int size() const { return (int)_size; }
+	void* get() const { return _base; }
+	static int computeSize(const std::vector<DataType>& types);
 private:
-	void* base;
-	size_t size;
-	size_t capacity;
+	void* _base;
+	size_t _size;
+	size_t _capacity;
 
 	void grow();
 };

@@ -27,17 +27,17 @@ HashedInt::HashedInt(const std::string& s)
 
 PackedData::PackedData()
 {
-	base = nullptr;
-	capacity = 0;
-	size = 0;
+	_base = nullptr;
+	_capacity = 0;
+	_size = 0;
 }
 
 PackedData::PackedData(const std::vector<DataType>& types, const std::vector<std::string>& data)
 {
 	int n = types.size();
-	capacity = getSize(types);
-	base = malloc(capacity);
-	size = 0;
+	_capacity = computeSize(types);
+	_base = malloc(_capacity);
+	_size = 0;
 	for(int i=0; i<n; i++){
 		auto& type = types[i];
 		switch (type) {
@@ -63,86 +63,127 @@ PackedData::PackedData(const std::vector<DataType>& types, const std::vector<std
 	}
 }
 
+PackedData::PackedData(int capacity) :
+	_capacity(capacity)
+{
+	_base = malloc(capacity);
+	_size = 0;
+}
+
 PackedData::PackedData(const PackedData& other)
 {
-	assert(other.capacity != 0);
-	assert(other.base != nullptr);
-	capacity = other.capacity;
-	base = malloc(capacity);
-	size = other.size;
+	assert(other._capacity != 0);
+	assert(other._base != nullptr);
+	_capacity = other._capacity;
+	_base = malloc(_capacity);
+	_size = other._size;
 	{
-		auto dst = static_cast<std::int32_t*>(base);
-		auto src = static_cast<std::int32_t*>(other.base);
-		for (int i = 0; i < size / 4; i++)
+		auto dst = static_cast<std::int32_t*>(_base);
+		auto src = static_cast<std::int32_t*>(other._base);
+		for (int i = 0; i < _size / 4; i++)
 			*(dst + i) = *(src + i);
 	}
-	if(size % 4 != 0){
-		int r = size % 4;
-		auto dst = static_cast<std::byte*>(base);
-		auto src = static_cast<std::byte*>(other.base);
-		for (int i = size - 1; i >= size - r; i--)
+	if(_size % 4 != 0){
+		int r = _size % 4;
+		auto dst = static_cast<std::byte*>(_base);
+		auto src = static_cast<std::byte*>(other._base);
+		for (int i = _size - 1; i >= _size - r; i--)
 			*(dst + i) = *(src + i);
 	}
 }
 
 PackedData::PackedData(PackedData&& other) noexcept
 {
-	capacity = other.capacity;
-	size = other.size;
-	free(base);
-	base = other.base;
-	other.base = nullptr;
+	_capacity = other._capacity;
+	_size = other._size;
+	free(_base);
+	_base = other._base;
+	other._base = nullptr;
+}
+
+PackedData& PackedData::operator=(const PackedData& other)
+{
+	assert(other._capacity != 0);
+	assert(other._base != nullptr);
+	if (_capacity < other._size) {
+		free(_base);
+		_capacity = other._size;
+		_base = malloc(_capacity);
+	}
+	_size = other._size;
+	{
+		auto dst = static_cast<std::int32_t*>(_base);
+		auto src = static_cast<std::int32_t*>(other._base);
+		for (int i = 0; i < _size / 4; i++)
+			*(dst + i) = *(src + i);
+	}
+	if (_size % 4 != 0) {
+		int r = _size % 4;
+		auto dst = static_cast<std::byte*>(_base);
+		auto src = static_cast<std::byte*>(other._base);
+		for (int i = _size - 1; i >= _size - r; i--)
+			*(dst + i) = *(src + i);
+	}
+	return *this;
 }
 
 PackedData& PackedData::operator=(PackedData&& other) noexcept
 {
-	capacity = other.capacity;
-	size = other.size;
-	free(base);
-	base = other.base;
-	other.base = nullptr;
+	_capacity = other._capacity;
+	_size = other._size;
+	free(_base);
+	_base = other._base;
+	other._base = nullptr;
 	return *this;
+}
+
+void PackedData::reset()
+{
+	free(_base);
+	_base = nullptr;
+	_capacity = 0;
+	_size = 0;
 }
 
 PackedData::~PackedData()
 {
-	free(base);
+	free(_base);
 }
 
 void PackedData::push(std::int32_t val)
 {
-	while (size + sizeof(val) > capacity)
+	while (_size + sizeof(val) > _capacity)
 		grow();
-	auto ptr = reinterpret_cast<std::int32_t*> ((size_t)base + size);
+	auto ptr = reinterpret_cast<std::int32_t*> ((size_t)_base + _size);
 	*ptr = val;
-	size += sizeof(val);
+	_size += sizeof(val);
 }
 
 void PackedData::push(std::int64_t val)
 {
-	while (size + sizeof(val) > capacity)
+	while (_size + sizeof(val) > _capacity)
 		grow();
-	auto ptr = reinterpret_cast<std::int64_t*> ((size_t)base + size);
+	auto ptr = reinterpret_cast<std::int64_t*> ((size_t)_base + _size);
 	*ptr = val;
-	size += sizeof(val);
+	_size += sizeof(val);
 }
 
 void PackedData::push(const std::string& val)
 {
-	while (size + sizeof(val) > capacity)
+	while (_size + sizeof(val) > _capacity)
 		grow();
-	auto ptr = reinterpret_cast<std::string*> ((size_t)base + size);
+	auto ptr = reinterpret_cast<std::string*> ((size_t)_base + _size);
 	*ptr = val;
-	size += sizeof(val);
+	_size += sizeof(val);
 }
 
 void PackedData::push(std::string&& val)
 {
-	while (size + sizeof(val) > capacity)
+	while (_size + sizeof(val) > _capacity)
 		grow();
-	auto ptr = reinterpret_cast<std::string*> ((size_t)base + size);
+	auto ptr = reinterpret_cast<std::string*> ((size_t)_base + _size);
 	*ptr = std::move(val);
-	size += sizeof(val);
+	_size += sizeof(val);
 }
 
 void PackedData::push(const Date& val)
@@ -160,7 +201,7 @@ void PackedData::push(const HashedInt& val)
 	push(val.data());
 }
 
-int PackedData::getSize(const std::vector<DataType>& types)
+int PackedData::computeSize(const std::vector<DataType>& types)
 {
 	int size = 0;
 	for (auto& type : types) {
@@ -189,14 +230,14 @@ int PackedData::getSize(const std::vector<DataType>& types)
 
 void PackedData::grow()
 {
-	if (capacity == 0) {
-		capacity = 4;
-		base = malloc(capacity);
+	if (_capacity == 0) {
+		_capacity = 4;
+		_base = malloc(_capacity);
 		return;
 	}
-	capacity *= 2;
-	void* dest = malloc(capacity);
-	std::memcpy(dest, base, size);
-	delete base;
-	base = dest;
+	_capacity *= 2;
+	void* dest = malloc(_capacity);
+	std::memcpy(dest, _base, _size);
+	delete _base;
+	_base = dest;
 }

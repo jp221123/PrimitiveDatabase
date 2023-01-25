@@ -14,7 +14,7 @@ class Index {
 	struct Node;
 	union Value {
 		Node* child;
-		int rid;
+		Int64 rid;
 	};
 
 	struct KeyValue {
@@ -29,7 +29,7 @@ class Index {
 			value = kv.value;
 			return *this;
 		}
-		KeyValue(const PackedData& key, int rid) :
+		KeyValue(const PackedData& key, Int64 rid) :
 			key{key}, value{.rid = rid} {}
 		KeyValue(Node* child) :
 			key(), value{.child = child} {}
@@ -59,21 +59,26 @@ class Index {
 		}
 	};
 
+	struct Result {
+		bool hasMerged{ false };
+		std::optional<Index::KeyValue> kvToInsert{};
+	};
+
 public:
 	Index(const std::vector<DataType>& types, const std::vector<std::string>& names, bool allowsDuplicate); 
 	Index(Index&& other) noexcept;
 	~Index();
 
 	// returns true if success
-	bool insert(const PackedData& key, int rid, bool checksIntegrity=false);
+	bool insert(const PackedData& key, Int64 rid, bool checksIntegrity=false);
 	// returns true if success
-	bool remove(const PackedData& key, int rid, bool checksIntegrity=false);
+	bool remove(const PackedData& key, Int64 rid, bool checksIntegrity=false);
 	// returns rids: equal search
 	std::vector<int> select(const PackedData& key);
 	// returns rids: range search
 	std::vector<int> select(const PackedData& loKey, const PackedData& hiKey);
 	// returns true if exists
-	bool select(const PackedData& key, int rid);
+	bool select(const PackedData& key, Int64 rid);
 	void dump(std::ostream& os = std::cout);
 	void checkIntegrity();
 
@@ -81,24 +86,25 @@ private:
 	const bool allowsDuplicate;
 	const int maxBranchingFactor;
 	const int maxLazySize;
-	std::vector<DataType> types;
-	std::vector<std::string> names;
+	const std::vector<DataType> types;
+	const std::vector<std::string> names;
 	Node* root;
 
-	std::optional<KeyValue> insert(Node* curr, std::vector<KeyValue>&& tempKvs);
-	std::optional<KeyValue> remove(Node* curr, std::vector<KeyValue>&& tempKvs);
+	Result insert(Node* curr, std::vector<KeyValue>&& tempKvs);
+	Result remove(Node* curr, std::vector<KeyValue>&& tempKvs);
 	// merge unsortedKvs into kvs and remove deleted kvs
 	void sortKvs(Node* curr);
+	void invalidateDuplicate(std::vector<KeyValue>& kvs1, std::vector<KeyValue>& kvs2);
 	// sort and perform split, redistribute, merge if necessary
-	std::optional<KeyValue> maintain(Node* curr);
+	Result maintain(Node* curr);
 	// raise or lower the depth if necessary
-	void maintainRoot(std::optional<KeyValue>&& res);
+	void maintainRoot(Result&& res);
 	std::vector<int> select(Node* curr, const PackedData& key);
 	void clean(Node* curr);
 
 	void dump(Node* curr, std::ostream& os);
-	void dump(const std::vector<KeyValue>& kvs, bool isLeaf, std::ostream& os);
-	void checkIntegrity(Node* curr, const PackedData& ub);
+	void dump(const std::vector<KeyValue>& kvs, bool printsRID, std::ostream& os);
+	void checkIntegrity(Node* curr, const PackedData& lb, bool existsLB, const PackedData& ub);
 
 	static int computeBranchingFactor(const std::vector<DataType>& types, int size);
 	int comparePackData(const PackedData& data1, const PackedData& data2);

@@ -24,7 +24,7 @@ void removeTest(const int N) {
 	Index tree(types, { "NUMBER", "COLOR" }, true);
 
 	tree.dump();
-	std::vector<std::vector<String>> data;
+	std::vector<std::vector<String>> data(N);
 	for (int i = 0; i < N; i++) {
 		for (int j = 0; j < 2; j++)
 			data[i].push_back(std::to_string(rand()));
@@ -33,16 +33,25 @@ void removeTest(const int N) {
 	for (int i = 0; i < N; i++) {
 		auto key = PackedData(types, data[i]);
 		tree.insert(key, i);
+		tree.checkIntegrity();
 	}
+	//tree.dump();
 	for (int i = 0; i < N; i++) {
 		auto key = PackedData(types, data[i]);
 		tree.remove(key, i);
+		//tree.dump();
 		tree.checkIntegrity();
 	}
 	tree.dump();
 }
 
 int main() {
-	insertTest(10000);
-	//removeTest(1000);
+	// insertTest(10000);
+	removeTest(1);
+	removeTest(5);
+	removeTest(12);
+	removeTest(16);
+	removeTest(20);
+	removeTest(100);
+	removeTest(1000);
 }
