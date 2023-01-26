@@ -96,7 +96,6 @@ PackedData::PackedData(PackedData&& other) noexcept
 {
 	_capacity = other._capacity;
 	_size = other._size;
-	free(_base);
 	_base = other._base;
 	other._base = nullptr;
 }
@@ -129,9 +128,9 @@ PackedData& PackedData::operator=(const PackedData& other)
 
 PackedData& PackedData::operator=(PackedData&& other) noexcept
 {
+	free(_base);
 	_capacity = other._capacity;
 	_size = other._size;
-	free(_base);
 	_base = other._base;
 	other._base = nullptr;
 	return *this;
@@ -199,6 +198,14 @@ void PackedData::push(const DateTime& val)
 void PackedData::push(const HashedInt& val)
 {
 	push(val.data());
+}
+
+PackedData PackedData::combine(const PackedData& data, std::int64_t val)
+{
+	PackedData res(data.size() + sizeof(std::int64_t));
+	res = data;
+	res.push(val);
+	return res;
 }
 
 int PackedData::computeSize(const std::vector<DataType>& types)

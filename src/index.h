@@ -3,8 +3,8 @@
 #include "constants.h"
 #include "data.h"
 
-#include <array>
-#include <map>
+#include <list>
+#include <vector>
 #include <optional>
 #include <iostream>
 
@@ -17,8 +17,8 @@
 class Index {
 	struct Node;
 	union Value {
-		Node* child;
 		Int64 rid;
+		Node* child;
 	};
 	static constexpr Node* INVALID_NODE = static_cast<Node*>(nullptr);
 	static constexpr Int64 INVALID_RID = reinterpret_cast<Int64>(nullptr);
@@ -77,8 +77,6 @@ public:
 
 	// returns true if success
 	bool insert(const PackedData& key, Int64 rid, bool checksIntegrity=false);
-	// todo: to support this operation that inserts multiple keys at once,
-	// Result must be changed so that it can contain multiple kvs, and maintainRoot() must be changed as well
 	bool insert(const std::vector<PackedData>& keys, const std::vector<Int64>& rids, bool checksIntegtrity = false);
 	// returns true if success
 	bool remove(const PackedData& key, Int64 rid, bool checksIntegrity=false);
@@ -86,7 +84,7 @@ public:
 	// returns rids: equal search
 	std::vector<int> select(const PackedData& key);
 	// returns rids: range search
-	std::vector<int> select(const PackedData& loKey, const PackedData& hiKey);
+	std::vector<int> selectRange(const PackedData& loKey, const PackedData& hiKey);
 	// returns true if exists
 	bool select(const PackedData& key, Int64 rid);
 	void dump(std::ostream& os = std::cout);
@@ -102,10 +100,13 @@ private:
 
 	Result insert(Node* curr, std::vector<KeyValue>&& tempKvs);
 	Result remove(Node* curr, std::vector<KeyValue>&& tempKvs);
-	std::vector<int> select(Node* curr, const PackedData& key);
+	std::vector<int> select(const PackedData& loKey, const PackedData& hiKey);
+	void select(Node* curr, const PackedData& loKey, const PackedData& hiKey, std::vector<int>& plus, std::vector<int>& minus);
 
 	// merge unsortedKvs into kvs and remove invalid kvs
 	void sortKvs(Node* curr);
+	// remove kvs contained in both arrays
+	void removeDuplicate(std::vector<KeyValue>& kvs1, std::vector<KeyValue>& kvs2);
 	// invalidate kvs contained in both arrays
 	void invalidateDuplicate(std::vector<KeyValue>& kvs1, std::vector<KeyValue>& kvs2);
 	void pushInsert(Node* curr);
@@ -116,7 +117,12 @@ private:
 	Result maintain(Node* curr);
 	// raise or lower the depth if necessary
 	void maintainRoot(Result&& res);
-	PackedData getSmallestKey(Node* curr);
+	// find the smallest key in the subtree rooted at curr
+	PackedData findSmallestKey(Node* curr);
+	// first iterator of kvs >= key
+	std::vector<KeyValue>::iterator lowerBound(Node* curr, const PackedData& key, int hintPos=0);
+	// first iterator of kvs > key
+	std::vector<KeyValue>::iterator upperBound(Node* curr, const PackedData& key, int hintPos=0);
 
 	void clean(Node* curr);
 
@@ -124,8 +130,9 @@ private:
 	void dump(const std::vector<KeyValue>& kvs, bool printsRID, std::ostream& os);
 	void checkIntegrity(Node* curr, const PackedData& lb, bool existsLB, const PackedData& ub);
 
+	PackedData makeInternalKey(const PackedData& key, Int64 rid);
 	static int computeBranchingFactor(const std::vector<DataType>& types, int size);
 	int comparePackData(const PackedData& data1, const PackedData& data2);
 	bool compareKeyValue(const KeyValue& kv1, const KeyValue& kv2);
-	bool isInvalid(const KeyValue& kv);
+	static bool isInvalid(const KeyValue& kv);
 };

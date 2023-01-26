@@ -80,6 +80,8 @@ public:
 	void push(const DateTime& val);
 	void push(const HashedInt& val);
 
+	static PackedData combine(const PackedData& data, std::int64_t val);
+
 	int size() const { return (int)_size; }
 	void* get() const { return _base; }
 	static int computeSize(const std::vector<DataType>& types);
